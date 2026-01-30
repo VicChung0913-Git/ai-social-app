@@ -13,7 +13,6 @@ class ChatMethods {
     required String currentUid,
     required String otherUid,
   }) async {
-    // Check if a direct chat already exists between these two users
     String chatRoomId = _generateDirectChatId(currentUid, otherUid);
 
     DocumentSnapshot doc =
@@ -57,7 +56,6 @@ class ChatMethods {
           .uploadImageToStorage('chatRoomPics', groupPic, false);
     }
 
-    // Initialize unread count for all members
     Map<String, int> unreadCount = {};
     for (String uid in members) {
       unreadCount[uid] = 0;
@@ -81,7 +79,6 @@ class ChatMethods {
         .doc(chatRoomId)
         .set(chatRoom.toJson());
 
-    // Send system message
     await sendMessage(
       chatRoomId: chatRoomId,
       senderId: createdBy,
@@ -117,7 +114,6 @@ class ChatMethods {
         readBy: [senderId],
       );
 
-      // Add message to subcollection
       await _firestore
           .collection('chatRooms')
           .doc(chatRoomId)
@@ -125,29 +121,12 @@ class ChatMethods {
           .doc(messageId)
           .set(message.toJson());
 
-      // Update chat room with last message info and increment unread
-      DocumentSnapshot chatRoomDoc =
-          await _firestore.collection('chatRooms').doc(chatRoomId).get();
-      Map<String, dynamic> data = chatRoomDoc.data() as Map<String, dynamic>;
-      List<String> members = List<String>.from(data['members'] ?? []);
-
-      Map<String, dynamic> updateData = {
-        'lastMessage': type == MessageType.image ? '📷 Photo' : text,
-        'lastMessageSender': senderId,
-        'lastMessageTime': Timestamp.fromDate(DateTime.now()),
-      };
-
-      // Increment unread count for other members
-      for (String uid in members) {
-        if (uid != senderId) {
-          updateData['unreadCount.$uid'] = FieldValue.increment(1);
-        }
-      }
-
-      await _firestore
-          .collection('chatRooms')
-          .doc(chatRoomId)
-          .update(updateData);
+      // Update chat room with last message info
+      await _updateChatRoomLastMessage(
+        chatRoomId: chatRoomId,
+        senderId: senderId,
+        lastMessage: type == MessageType.image ? '📷 Photo' : text,
+      );
 
       return 'success';
     } catch (e) {
@@ -188,33 +167,175 @@ class ChatMethods {
           .doc(messageId)
           .set(message.toJson());
 
-      // Update last message
-      DocumentSnapshot chatRoomDoc =
-          await _firestore.collection('chatRooms').doc(chatRoomId).get();
-      Map<String, dynamic> data = chatRoomDoc.data() as Map<String, dynamic>;
-      List<String> members = List<String>.from(data['members'] ?? []);
-
-      Map<String, dynamic> updateData = {
-        'lastMessage': '📷 Photo',
-        'lastMessageSender': senderId,
-        'lastMessageTime': Timestamp.fromDate(DateTime.now()),
-      };
-
-      for (String uid in members) {
-        if (uid != senderId) {
-          updateData['unreadCount.$uid'] = FieldValue.increment(1);
-        }
-      }
-
-      await _firestore
-          .collection('chatRooms')
-          .doc(chatRoomId)
-          .update(updateData);
+      await _updateChatRoomLastMessage(
+        chatRoomId: chatRoomId,
+        senderId: senderId,
+        lastMessage: '📷 Photo',
+      );
 
       return 'success';
     } catch (e) {
       return e.toString();
     }
+  }
+
+  // Send a sticker message
+  Future<String> sendStickerMessage({
+    required String chatRoomId,
+    required String senderId,
+    required String senderName,
+    required String senderPhotoUrl,
+    required String stickerEmoji,
+    required String stickerPackId,
+  }) async {
+    try {
+      String messageId = const Uuid().v1();
+
+      Message message = Message(
+        messageId: messageId,
+        senderId: senderId,
+        senderName: senderName,
+        senderPhotoUrl: senderPhotoUrl,
+        text: '',
+        stickerEmoji: stickerEmoji,
+        stickerPackId: stickerPackId,
+        type: MessageType.sticker,
+        timestamp: DateTime.now(),
+        readBy: [senderId],
+      );
+
+      await _firestore
+          .collection('chatRooms')
+          .doc(chatRoomId)
+          .collection('messages')
+          .doc(messageId)
+          .set(message.toJson());
+
+      await _updateChatRoomLastMessage(
+        chatRoomId: chatRoomId,
+        senderId: senderId,
+        lastMessage: '[Sticker] $stickerEmoji',
+      );
+
+      return 'success';
+    } catch (e) {
+      return e.toString();
+    }
+  }
+
+  // Recall a message (within 15 minutes)
+  Future<String> recallMessage({
+    required String chatRoomId,
+    required String messageId,
+    required String senderId,
+  }) async {
+    try {
+      DocumentSnapshot doc = await _firestore
+          .collection('chatRooms')
+          .doc(chatRoomId)
+          .collection('messages')
+          .doc(messageId)
+          .get();
+
+      if (!doc.exists) return 'Message not found';
+
+      Message message = Message.fromSnap(doc);
+
+      // Only sender can recall
+      if (message.senderId != senderId) {
+        return 'You can only recall your own messages';
+      }
+
+      // Check 15-minute window
+      if (!message.canRecall) {
+        return 'Message can only be recalled within 15 minutes';
+      }
+
+      await _firestore
+          .collection('chatRooms')
+          .doc(chatRoomId)
+          .collection('messages')
+          .doc(messageId)
+          .update({
+        'isRecalled': true,
+        'recalledAt': Timestamp.fromDate(DateTime.now()),
+        'text': '',
+        'imageUrl': null,
+        'stickerEmoji': null,
+      });
+
+      // Update last message if this was the last message
+      DocumentSnapshot chatRoomDoc =
+          await _firestore.collection('chatRooms').doc(chatRoomId).get();
+      Map<String, dynamic> chatData =
+          chatRoomDoc.data() as Map<String, dynamic>;
+      if (chatData['lastMessage'] == message.text ||
+          chatData['lastMessage'] == '📷 Photo') {
+        await _firestore
+            .collection('chatRooms')
+            .doc(chatRoomId)
+            .update({'lastMessage': 'Message recalled'});
+      }
+
+      return 'success';
+    } catch (e) {
+      return e.toString();
+    }
+  }
+
+  // Delete a message (only for self, removes from view)
+  Future<void> deleteMessage(String chatRoomId, String messageId) async {
+    await _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
+        .collection('messages')
+        .doc(messageId)
+        .delete();
+  }
+
+  // Delete message for self only (soft delete via adding uid to deletedFor array)
+  Future<void> deleteMessageForMe({
+    required String chatRoomId,
+    required String messageId,
+    required String uid,
+  }) async {
+    await _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
+        .collection('messages')
+        .doc(messageId)
+        .update({
+      'deletedFor': FieldValue.arrayUnion([uid]),
+    });
+  }
+
+  // Helper to update chat room last message and unread counts
+  Future<void> _updateChatRoomLastMessage({
+    required String chatRoomId,
+    required String senderId,
+    required String lastMessage,
+  }) async {
+    DocumentSnapshot chatRoomDoc =
+        await _firestore.collection('chatRooms').doc(chatRoomId).get();
+    Map<String, dynamic> data = chatRoomDoc.data() as Map<String, dynamic>;
+    List<String> members = List<String>.from(data['members'] ?? []);
+
+    Map<String, dynamic> updateData = {
+      'lastMessage': lastMessage,
+      'lastMessageSender': senderId,
+      'lastMessageTime': Timestamp.fromDate(DateTime.now()),
+    };
+
+    for (String uid in members) {
+      if (uid != senderId) {
+        updateData['unreadCount.$uid'] = FieldValue.increment(1);
+      }
+    }
+
+    await _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
+        .update(updateData);
   }
 
   // Get chat rooms for current user
@@ -269,15 +390,5 @@ class ChatMethods {
   String _generateDirectChatId(String uid1, String uid2) {
     List<String> ids = [uid1, uid2]..sort();
     return '${ids[0]}_${ids[1]}';
-  }
-
-  // Delete a message
-  Future<void> deleteMessage(String chatRoomId, String messageId) async {
-    await _firestore
-        .collection('chatRooms')
-        .doc(chatRoomId)
-        .collection('messages')
-        .doc(messageId)
-        .delete();
   }
 }
